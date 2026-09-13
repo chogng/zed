@@ -22,7 +22,8 @@ use crate::{
     EditorSettings, EditorSnapshot, GutterHoverButton, HoveredCursor, JumpData,
     PhantomDiffReviewIndicator, SelectPhase, Selection, SelectionDragState,
     display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
-    hover_popover::hover_at, mouse_context_menu, scroll::ScrollPixelOffset,
+    hover_popover::hover_at, inlays::inlay_hints::HintTarget, mouse_context_menu,
+    scroll::ScrollPixelOffset,
 };
 
 impl EditorElement {
@@ -240,8 +241,10 @@ impl EditorElement {
 
         // Don't trigger hover popover if mouse is hovering over context menu
         if text_hovered {
+            let hint_glyph = position_map.inlay_hint_glyph_for_position(event.position);
             editor.update_hovered_link(
                 point_for_position,
+                hint_glyph,
                 Some(event.position),
                 &position_map.snapshot,
                 modifiers,
@@ -249,7 +252,9 @@ impl EditorElement {
                 cx,
             );
 
-            if let Some(point) = point_for_position.as_valid() {
+            if hint_glyph.is_none()
+                && let Some(point) = point_for_position.as_valid()
+            {
                 let anchor = position_map
                     .snapshot
                     .buffer_snapshot()
@@ -259,7 +264,7 @@ impl EditorElement {
             } else {
                 editor.update_inlay_link_and_hover_points(
                     &position_map.snapshot,
-                    point_for_position,
+                    hint_glyph,
                     Some(event.position),
                     modifiers.secondary(),
                     modifiers.shift,
@@ -613,11 +618,37 @@ impl EditorElement {
             return;
         }
 
+        let hint_glyph = text_hitbox
+            .is_hovered(window)
+            .then(|| position_map.inlay_hint_glyph_for_position(event.position))
+            .flatten();
         if !event.modifiers.modified()
-            && text_hitbox.is_hovered(window)
-            && editor.hovered_inlay_hint_command().is_some_and(|command| {
-                command.contains_point(&position_map.snapshot, point_for_position)
-            })
+            && editor
+                .hovered_inlay_hint_command()
+                .is_some_and(|command| command.contains_glyph(&position_map.snapshot, hint_glyph))
+        {
+            cx.stop_propagation();
+            return;
+        }
+
+        if click_count == 2
+            && !modifiers.modified()
+            && let Some((hint, offset_in_hint)) =
+                hint_glyph.and_then(|glyph| position_map.snapshot.inlay_hint_at(glyph))
+            && let Some(buffer_id) = hint
+                .position
+                .raw_text_anchor()
+                .map(|anchor| anchor.buffer_id)
+            && editor.apply_inlay_hint_text_edits(
+                [HintTarget {
+                    buffer_id,
+                    hint_id: hint.id,
+                    position: hint.position,
+                }],
+                Some(offset_in_hint),
+                window,
+                cx,
+            )
         {
             cx.stop_propagation();
             return;
@@ -966,8 +997,8 @@ impl EditorElement {
                 && !mouse_event.up.modifiers.modified()
                 && editor.activate_hovered_inlay_hint_command(
                     &position_map.snapshot,
-                    position_map.point_for_position(mouse_event.down.position),
-                    point,
+                    position_map.inlay_hint_glyph_for_position(mouse_event.down.position),
+                    position_map.inlay_hint_glyph_for_position(mouse_position),
                     cx,
                 )
             {

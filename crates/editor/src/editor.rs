@@ -4164,6 +4164,7 @@ impl Editor {
 
         self.update_hovered_link(
             position_map.point_for_position(mouse_position),
+            position_map.inlay_hint_glyph_for_position(mouse_position),
             Some(mouse_position),
             &position_map.snapshot,
             modifiers,
@@ -10112,6 +10113,7 @@ impl Editor {
                 self.register_visible_buffers(cx);
                 self.update_lsp_data(Some(buffer_id), window, cx);
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+                self.refresh_inlay_hints_at_selections(&self.display_snapshot(cx), cx);
                 self.refresh_runnables(None, window, cx);
                 self.bracket_fetched_tree_sitter_chunks
                     .retain(|range, _| range.start.buffer_id != buffer_id);
