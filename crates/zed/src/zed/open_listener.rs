@@ -1,4 +1,5 @@
 use crate::handle_open_request;
+use crate::restore_last_session;
 use crate::restore_or_create_workspace;
 use agent_ui::ExternalSourcePrompt;
 use anyhow::{Context as _, Result, anyhow};
@@ -578,6 +579,7 @@ pub async fn handle_cli_connection(
         Box<dyn CliResponseSink>,
     ),
     app_state: Arc<AppState>,
+    restore_last_session_first: bool,
     cx: &mut AsyncApp,
 ) {
     if let Some(request) = requests.next().await {
@@ -596,6 +598,9 @@ pub async fn handle_cli_connection(
                 cwd,
             } => {
                 if !urls.is_empty() {
+                    if restore_last_session_first {
+                        restore_last_session(app_state.clone(), cx).await.log_err();
+                    }
                     cx.update(|cx| {
                         match OpenRequest::parse(
                             RawOpenRequest {
@@ -663,6 +668,7 @@ pub async fn handle_cli_connection(
                     app_state.clone(),
                     env,
                     cwd,
+                    restore_last_session_first,
                     cx,
                 )
                 .await;
@@ -842,6 +848,7 @@ async fn open_workspaces(
     app_state: Arc<AppState>,
     env: Option<collections::HashMap<String, String>>,
     cwd: Option<PathBuf>,
+    restore_last_session_first: bool,
     cx: &mut AsyncApp,
 ) -> Result<()> {
     if paths.is_empty()
@@ -849,6 +856,9 @@ async fn open_workspaces(
         && !matches!(open_behavior, cli::OpenBehavior::AlwaysNew)
     {
         return restore_or_create_workspace(app_state, cx).await;
+    }
+    if restore_last_session_first {
+        restore_last_session(app_state.clone(), cx).await.log_err();
     }
 
     let grouped_locations: Vec<(SerializedWorkspaceLocation, PathList)> =
@@ -2487,6 +2497,16 @@ mod tests {
         open_request: CliRequest,
         prompt_response: Option<cli::CliBehaviorSetting>,
     ) -> (i32, bool) {
+        run_cli_with_zed_handler_on_startup(cx, app_state, open_request, prompt_response, false)
+    }
+
+    fn run_cli_with_zed_handler_on_startup(
+        cx: &mut TestAppContext,
+        app_state: Arc<AppState>,
+        open_request: CliRequest,
+        prompt_response: Option<cli::CliBehaviorSetting>,
+        restore_last_session_first: bool,
+    ) -> (i32, bool) {
         cx.executor().allow_parking();
 
         let (request_tx, request_rx) = mpsc::unbounded::<CliRequest>();
@@ -2494,7 +2514,13 @@ mod tests {
         let response_sink: Box<dyn CliResponseSink> = Box::new(SyncResponseSender(response_tx));
 
         cx.spawn(|mut cx| async move {
-            handle_cli_connection((request_rx, response_sink), app_state, &mut cx).await;
+            handle_cli_connection(
+                (request_rx, response_sink),
+                app_state,
+                restore_last_session_first,
+                &mut cx,
+            )
+            .await;
         })
         .detach();
 
@@ -2782,6 +2808,93 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_e2e_startup_cli_with_paths_restores_last_session(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({
+                    "project": { "file.txt": "content" },
+                    "other": { "b.txt": "b" }
+                }),
+            )
+            .await;
+
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+
+        open_workspace_file(path!("/project"), Default::default(), app_state.clone(), cx).await;
+        assert_eq!(cx.windows().len(), 1);
+
+        let multi_workspace = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
+        let serialization_tasks = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.flush_all_serialization(window, cx)
+            })
+            .unwrap();
+        futures::future::join_all(serialization_tasks).await;
+
+        multi_workspace
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(cx.windows().len(), 0);
+
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _cx| {
+                app_session.replace_session_for_test(Session::test_with_old_session(session_id));
+            });
+        });
+
+        let (status, prompt_shown) = run_cli_with_zed_handler_on_startup(
+            cx,
+            app_state,
+            make_cli_open_request(
+                vec![path!("/other/b.txt").to_string()],
+                cli::OpenBehavior::ExistingWindow,
+            ),
+            None,
+            true,
+        );
+
+        assert_eq!(status, 0);
+        assert!(!prompt_shown);
+        assert_eq!(cx.windows().len(), 1);
+
+        let restored_window = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
+        let (root_paths, tab_paths) = restored_window
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                let root_paths = workspace
+                    .root_paths(cx)
+                    .into_iter()
+                    .map(|path| path.as_ref().to_path_buf())
+                    .collect::<Vec<_>>();
+                let project = workspace.project().read(cx);
+                let tab_paths = workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .map(|item| {
+                        let project_path = item
+                            .project_path(cx)
+                            .expect("tab should have a project path");
+                        project
+                            .absolute_path(&project_path, cx)
+                            .expect("tab should have an absolute path")
+                    })
+                    .collect::<Vec<_>>();
+                (root_paths, tab_paths)
+            })
+            .unwrap();
+        assert_eq!(root_paths, vec![PathBuf::from(path!("/project"))]);
+        assert_eq!(tab_paths, vec![PathBuf::from(path!("/other/b.txt"))]);
     }
 
     #[gpui::test]

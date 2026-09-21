@@ -31,7 +31,7 @@ use futures::{FutureExt, StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
+    App, AppContext, Application, AsyncApp, QuitMode, TaskExt, UpdateGlobal as _, block_on,
 };
 use gpui_platform;
 
@@ -939,10 +939,16 @@ fn main() {
                     }
                 }
             }),
-            Some(request) => {
-                handle_open_request(request, app_state.clone(), cx);
-                Task::ready(())
-            }
+            Some(request) => cx.spawn({
+                let app_state = app_state.clone();
+                async move |cx| {
+                    if let Err(e) =
+                        restore_last_session_and_handle_open_request(request, app_state, cx).await
+                    {
+                        fail_to_open_window_async(e, cx)
+                    }
+                }
+            }),
             None => cx.spawn({
                 let app_state = app_state.clone();
                 async move |cx| {
@@ -1005,12 +1011,28 @@ fn main() {
     });
 }
 
+async fn restore_last_session_and_handle_open_request(
+    request: OpenRequest,
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    if let Some(OpenRequestKind::CliConnection(connection)) = request.kind {
+        handle_cli_connection(connection, app_state, true, cx).await;
+        return Ok(());
+    }
+    restore_last_session(app_state.clone(), cx).await.log_err();
+    cx.update(|cx| handle_open_request(request, app_state, cx));
+    Ok(())
+}
+
 fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut App) {
     if let Some(kind) = request.kind {
         match kind {
             OpenRequestKind::CliConnection(connection) => {
-                cx.spawn(async move |cx| handle_cli_connection(connection, app_state, cx).await)
-                    .detach();
+                cx.spawn(async move |cx| {
+                    handle_cli_connection(connection, app_state, false, cx).await
+                })
+                .detach();
             }
             OpenRequestKind::FocusApp => {
                 cx.spawn(async move |cx| {
@@ -1426,6 +1448,60 @@ pub(crate) async fn restore_or_create_workspace(
     cx: &mut AsyncApp,
 ) -> Result<()> {
     let kvp = cx.update(|cx| KeyValueStore::global(cx));
+    if restore_last_session(app_state.clone(), cx).await? {
+        // If the user cancelled a failed remote connection at startup,
+        // open_remote_project returns Ok but removes the window, so error_count
+        // stays 0 and the toast fallback above does not trigger. Without this
+        // check, Zed would exit silently.
+        if cx.update(|cx| cx.windows().is_empty()) {
+            cx.update(|cx| {
+                workspace::open_new(
+                    Default::default(),
+                    app_state.clone(),
+                    cx,
+                    |workspace, window, cx| {
+                        let restore_on_startup =
+                            WorkspaceSettings::get_global(cx).restore_on_startup;
+                        match restore_on_startup {
+                            workspace::RestoreOnStartupBehavior::Launchpad => {}
+                            _ => {
+                                Editor::new_file(workspace, &Default::default(), window, cx);
+                            }
+                        }
+                    },
+                )
+            })
+            .await?;
+        }
+    } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
+        cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
+    } else {
+        cx.update(|cx| {
+            workspace::open_new(
+                Default::default(),
+                app_state,
+                cx,
+                |workspace, window, cx| {
+                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
+                    match restore_on_startup {
+                        workspace::RestoreOnStartupBehavior::Launchpad => {}
+                        _ => {
+                            Editor::new_file(workspace, &Default::default(), window, cx);
+                        }
+                    }
+                },
+            )
+        })
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn restore_last_session(
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<bool> {
     if let Some(multi_workspaces) = restorable_workspaces(cx, &app_state).await {
         let mut error_count = 0;
         for multi_workspace in multi_workspaces {
@@ -1531,53 +1607,10 @@ pub(crate) async fn restore_or_create_workspace(
             }
         }
 
-        // If the user cancelled a failed remote connection at startup,
-        // open_remote_project returns Ok but removes the window, so error_count
-        // stays 0 and the toast fallback above does not trigger. Without this
-        // check, Zed would exit silently.
-        if cx.update(|cx| cx.windows().is_empty()) {
-            cx.update(|cx| {
-                workspace::open_new(
-                    Default::default(),
-                    app_state.clone(),
-                    cx,
-                    |workspace, window, cx| {
-                        let restore_on_startup =
-                            WorkspaceSettings::get_global(cx).restore_on_startup;
-                        match restore_on_startup {
-                            workspace::RestoreOnStartupBehavior::Launchpad => {}
-                            _ => {
-                                Editor::new_file(workspace, &Default::default(), window, cx);
-                            }
-                        }
-                    },
-                )
-            })
-            .await?;
-        }
-    } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
-        cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
+        Ok(true)
     } else {
-        cx.update(|cx| {
-            workspace::open_new(
-                Default::default(),
-                app_state,
-                cx,
-                |workspace, window, cx| {
-                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-                        }
-                    }
-                },
-            )
-        })
-        .await?;
+        Ok(false)
     }
-
-    Ok(())
 }
 
 async fn restorable_workspaces(

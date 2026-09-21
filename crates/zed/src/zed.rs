@@ -7810,6 +7810,100 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_startup_open_request_restores_last_session(cx: &mut TestAppContext) {
+        use session::Session;
+
+        let app_state = init_test(cx);
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            init(cx);
+        });
+
+        let project_dir = PathBuf::from(path!("/project"));
+        let requested_file = PathBuf::from(path!("/other/b.txt"));
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(
+                path!("/"),
+                json!({
+                    "project": { "a.txt": "a" },
+                    "other": { "b.txt": "b" }
+                }),
+            )
+            .await;
+
+        let session_id = cx.read(|cx| app_state.session.read(cx).id().to_owned());
+        let window =
+            open_test_project_window_with_tabs(&app_state, &project_dir, &[rel_path("a.txt")], cx)
+                .await;
+        cx.run_until_parked();
+        flush_workspace_serialization(&window, cx).await;
+        cx.run_until_parked();
+
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("workspace window was closed");
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            app_state.session.update(cx, |app_session, _cx| {
+                app_session
+                    .replace_session_for_test(Session::test_with_old_session(session_id.clone()));
+            });
+        });
+
+        let request = OpenRequest {
+            open_paths: vec![requested_file.to_string_lossy().into_owned()],
+            ..OpenRequest::default()
+        };
+        let mut async_cx = cx.to_async();
+        crate::restore_last_session_and_handle_open_request(
+            request,
+            app_state.clone(),
+            &mut async_cx,
+        )
+        .await
+        .expect("failed to handle the startup open request");
+        cx.run_until_parked();
+
+        let windows = cx.read(|cx| {
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(windows.len(), 1);
+        let (root_paths, tab_paths) = windows[0]
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                let root_paths = workspace
+                    .root_paths(cx)
+                    .into_iter()
+                    .map(|path| path.as_ref().to_path_buf())
+                    .collect::<Vec<_>>();
+                let project = workspace.project().read(cx);
+                let tab_paths = workspace
+                    .active_pane()
+                    .read(cx)
+                    .items()
+                    .map(|item| {
+                        let project_path = item
+                            .project_path(cx)
+                            .expect("tab should have a project path");
+                        project
+                            .absolute_path(&project_path, cx)
+                            .expect("tab should have an absolute path")
+                    })
+                    .collect::<Vec<_>>();
+                (root_paths, tab_paths)
+            })
+            .expect("restored workspace window was closed");
+        assert_eq!(root_paths, vec![project_dir.clone()]);
+        assert_eq!(tab_paths, vec![project_dir.join("a.txt"), requested_file]);
+    }
+
+    #[gpui::test]
     async fn test_restored_project_groups_survive_workspace_key_change(cx: &mut TestAppContext) {
         use session::Session;
         use util::path_list::PathList;
