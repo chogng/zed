@@ -9049,6 +9049,7 @@ impl Element for EditorElement {
                         row_windowing,
                         style,
                         window,
+                        cx,
                     );
 
                     let mut highlighted_rows =
@@ -11210,11 +11211,23 @@ fn max_shaped_line_len(snapshot: &EditorSnapshot) -> usize {
     }
 }
 
-fn ruler_shaper(style: &EditorStyle, window: &Window) -> RulerShaper {
+fn ruler_shaper(
+    snapshot: &EditorSnapshot,
+    display_row: DisplayRow,
+    style: &EditorStyle,
+    window: &Window,
+    cx: &App,
+) -> RulerShaper {
+    let use_tree_sitter =
+        !snapshot.semantic_tokens_enabled || snapshot.use_tree_sitter_for_syntax(display_row, cx);
     RulerShaper {
         text_system: window.text_system().clone(),
         style: style.clone(),
         font_size: style.text.font_size.to_pixels(window.rem_size()),
+        language_aware: LanguageAwareStyling {
+            tree_sitter: use_tree_sitter,
+            diagnostics: true,
+        },
     }
 }
 
@@ -11226,8 +11239,9 @@ fn long_row_columns(
     cell: GridCell,
     style: &EditorStyle,
     window: &Window,
+    cx: &App,
 ) -> Range<u32> {
-    let shaper = ruler_shaper(style, window);
+    let shaper = ruler_shaper(snapshot, display_row, style, window, cx);
     match snapshot.grid_window(display_row, row_len, viewport, cell, &shaper) {
         Some((columns, _)) => columns,
         None => snapshot
@@ -11243,6 +11257,7 @@ fn visible_highlight_ranges(
     row_windowing: Option<(HorizontalViewport, GridCell)>,
     style: &EditorStyle,
     window: &Window,
+    cx: &App,
 ) -> Vec<Range<Anchor>> {
     let Some((viewport, cell)) = row_windowing else {
         return vec![visible_range];
@@ -11266,6 +11281,7 @@ fn visible_highlight_ranges(
                 cell,
                 style,
                 window,
+                cx,
             );
             ranges.push(
                 anchor_at(DisplayPoint::new(display_row, bounds.start), Bias::Left)
@@ -11317,7 +11333,7 @@ fn layout_long_row(
     cx: &mut App,
 ) -> LineWithInvisibles {
     let font_size = style.text.font_size.to_pixels(window.rem_size());
-    let shaper = ruler_shaper(style, window);
+    let shaper = ruler_shaper(snapshot, display_row, style, window, cx);
     let Some(viewport) = viewport else {
         let geometry = if snapshot.row_has_exact_grid(display_row, cell) {
             WindowedRowGeometry::new(row_len, cell, 0..0)
@@ -11327,27 +11343,13 @@ fn layout_long_row(
         return LineWithInvisibles::grid_only(geometry, font_size);
     };
 
-    let use_tree_sitter =
-        !snapshot.semantic_tokens_enabled || snapshot.use_tree_sitter_for_syntax(display_row, cx);
-    let language_aware = LanguageAwareStyling {
-        tree_sitter: use_tree_sitter,
-        diagnostics: true,
-    };
-    let shape = |bytes: Range<u32>, keep_font_styles: bool, window: &mut Window, cx: &mut App| {
-        let chunks = snapshot
-            .highlighted_chunks_in_range(
-                DisplayPoint::new(display_row, bytes.start)
-                    ..DisplayPoint::new(display_row, bytes.end),
-                language_aware,
-                style,
-            )
-            .map(|chunk| {
-                if keep_font_styles {
-                    chunk
-                } else {
-                    chunk.without_font_styles()
-                }
-            });
+    let language_aware = shaper.language_aware;
+    let shape = |bytes: Range<u32>, window: &mut Window, cx: &mut App| {
+        let chunks = snapshot.highlighted_chunks_in_range(
+            DisplayPoint::new(display_row, bytes.start)..DisplayPoint::new(display_row, bytes.end),
+            language_aware,
+            style,
+        );
         LineWithInvisibles::from_chunks(
             chunks,
             style,
@@ -11377,46 +11379,35 @@ fn layout_long_row(
             }
         })
     };
-    let shape_to_width = |bytes: Range<u32>,
-                          expected_width: ScrollPixelOffset,
-                          window: &mut Window,
-                          cx: &mut App| {
-        let shaped = shape(bytes.clone(), true, window, cx);
-        if (ScrollPixelOffset::from(shaped.shaped_width()) - expected_width).abs()
+    let fits = |shaped: &LineWithInvisibles, expected_width: ScrollPixelOffset| {
+        (ScrollPixelOffset::from(shaped.shaped_width()) - expected_width).abs()
             <= GridCell::FIT_TOLERANCE
-        {
-            shaped
-        } else {
-            shape(bytes, false, window, cx)
-        }
     };
 
     let mut shaped;
     let geometry;
     if let Some((columns, _)) = snapshot.grid_window(display_row, row_len, &viewport, cell, &shaper)
     {
-        let grid_width = ScrollPixelOffset::from(cell.width) * columns.len() as ScrollPixelOffset;
-        shaped = shape_to_width(columns.clone(), grid_width, window, cx);
+        shaped = shape(columns.clone(), window, cx);
         geometry = WindowedRowGeometry::new(row_len, cell, columns);
     } else {
         let ruled = snapshot.ruled_row(display_row, shaper);
         let columns = ruled.columns_for_viewport(&viewport, cell);
-        let mut chunks = ruled.chunk_columns(columns.clone());
-        let first_chunk = chunks.next().unwrap_or(0..0);
-        shaped = shape_to_width(
-            first_chunk.clone(),
-            ruled.chunk_width(first_chunk),
-            window,
-            cx,
-        );
-        for chunk in chunks {
-            shaped.append(shape_to_width(
-                chunk.clone(),
-                ruled.chunk_width(chunk),
-                window,
-                cx,
-            ));
-        }
+        let whole_window = cell
+            .monospace
+            .then(|| shape(columns.clone(), window, cx))
+            .filter(|whole_window| fits(whole_window, ruled.chunk_width(columns.clone())));
+        shaped = match whole_window {
+            Some(whole_window) => whole_window,
+            None => {
+                let mut chunks = ruled.chunk_columns(columns.clone());
+                let mut shaped = shape(chunks.next().unwrap_or(0..0), window, cx);
+                for chunk in chunks {
+                    shaped.append(shape(chunk, window, cx));
+                }
+                shaped
+            }
+        };
         geometry = WindowedRowGeometry::ruled(ruled, row_len, cell, columns);
     }
 
@@ -11948,8 +11939,9 @@ fn compute_auto_height_layout(
 
     let editor_width = text_width - gutter_dimensions.margin - overscroll.width - em_width;
     let wrap_width = calculate_wrap_width(editor.soft_wrap_mode(cx), editor_width, em_width)
-        .map(|width| width.min(editor_width));
-    if editor.set_wrap_width(wrap_width, cx) {
+        .unwrap_or(editor_width)
+        .min(editor_width);
+    if editor.set_wrap_width(Some(wrap_width), cx) {
         snapshot = editor.snapshot(window, cx);
     }
 
@@ -12240,6 +12232,38 @@ mod tests {
                 "Soft wrapped editor should have no horizontal scrolling!"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_auto_height_editors_wrap_regardless_of_soft_wrap_setting(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx, |settings| {
+            settings.defaults.soft_wrap = Some(language_settings::SoftWrap::None);
+        });
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple(&"a ".repeat(100), cx);
+            Editor::new(
+                EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines: Some(10),
+                },
+                buffer,
+                None,
+                window,
+                cx,
+            )
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+
+        let (_, state) = cx.draw(Default::default(), size(px(200.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
+        assert!(state.position_map.snapshot.has_soft_wraps());
+        assert_eq!(state.position_map.scroll_max.x, 0.);
+        assert!(state.position_map.snapshot.max_point().row().0 >= 4);
     }
 
     #[gpui::test]
@@ -13772,6 +13796,7 @@ mod tests {
                         } else {
                             assert_eq!(geometry.window(), &(0..0));
                             assert!(!row_window.is_empty());
+                            assert_eq!(layout.fragments.len(), 1);
                         }
                         assert_eq!(
                             layout.shaped_start_index() + layout.shaped_len(),
@@ -13800,7 +13825,7 @@ mod tests {
                         {
                             let x = layout.x_for_index(index);
                             assert!(
-                                (x - row_layout.x_for_index(index)).abs() < 0.1,
+                                (x - row_layout.x_for_index(index)).abs() < shaping_tolerance,
                                 "{text:?} at {scroll_columns}: element and display map disagree at byte {index}"
                             );
                             assert!(
@@ -13860,6 +13885,7 @@ mod tests {
                     None,
                     &style,
                     window,
+                    cx,
                 );
                 assert_eq!(ranges.len(), 1);
 
@@ -13870,6 +13896,7 @@ mod tests {
                     Some((viewport, details.grid_cell())),
                     &style,
                     window,
+                    cx,
                 );
                 let offsets = ranges
                     .iter()
@@ -14004,6 +14031,7 @@ mod tests {
                     Some((details.horizontal_viewport(&snapshot), details.grid_cell())),
                     &style,
                     window,
+                    cx,
                 );
                 assert_eq!(ranges.len(), 3);
 

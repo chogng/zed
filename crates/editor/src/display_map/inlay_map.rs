@@ -1149,7 +1149,11 @@ impl InlaySnapshot {
         summary
     }
 
-    pub fn has_rendered_inlays(&self, range: Range<InlayPoint>) -> bool {
+    pub fn has_inlays_matching(
+        &self,
+        range: Range<InlayPoint>,
+        mut predicate: impl FnMut(&Inlay) -> bool,
+    ) -> bool {
         let mut cursor = self.transforms.cursor::<InlayPoint>(());
         cursor.seek(&range.start, Bias::Right);
         while let Some(transform) = cursor.item() {
@@ -1157,7 +1161,7 @@ impl InlaySnapshot {
                 break;
             }
             if let Transform::Inlay(inlay) = transform
-                && inlay_chunk_renderer(inlay).is_some()
+                && predicate(inlay)
             {
                 return true;
             }
@@ -1391,7 +1395,7 @@ impl BufferOffsetToInlayPointCursor<'_> {
     }
 }
 
-fn inlay_chunk_renderer(inlay: &Inlay) -> Option<ChunkRenderer> {
+pub(super) fn inlay_chunk_renderer(inlay: &Inlay) -> Option<ChunkRenderer> {
     match inlay.id {
         InlayId::ReplResult(_) => {
             let text = inlay.text().to_string();

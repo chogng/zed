@@ -10,6 +10,23 @@ impl Editor {
     }
 
     pub fn text_layout_details(&self, window: &mut Window, cx: &mut App) -> TextLayoutDetails {
+        let tree_sitter_by_buffer = self.semantic_token_state.enabled().then(|| {
+            Arc::new(
+                self.buffer
+                    .read(cx)
+                    .all_buffers()
+                    .into_iter()
+                    .map(|buffer| {
+                        let buffer = buffer.read(cx).snapshot();
+                        let settings = LanguageSettings::for_buffer_snapshot(&buffer, None, cx);
+                        (
+                            buffer.remote_id(),
+                            settings.semantic_tokens.use_tree_sitter(),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>(),
+            )
+        });
         TextLayoutDetails {
             text_system: window.text_system().clone(),
             editor_style: self.style.clone().unwrap_or_else(|| self.create_style(cx)),
@@ -19,6 +36,7 @@ impl Editor {
             visible_columns: self.visible_column_count(),
             vertical_scroll_margin: self.scroll_manager.vertical_scroll_margin,
             grid_cell: OnceCell::new(),
+            tree_sitter_by_buffer,
         }
     }
 

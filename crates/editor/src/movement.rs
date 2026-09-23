@@ -7,10 +7,12 @@ use crate::{
     display_map::{GridCell, HighlightedChunk, HorizontalViewport, RulerShaper},
     scroll::{ScrollOffset, SharedScrollAnchor},
 };
+use collections::HashMap;
 use gpui::{LineLayout, Pixels, TextAlign, WindowTextSystem};
-use language::{CharClassifier, Point};
+use language::{CharClassifier, LanguageAwareStyling, Point};
 use multi_buffer::{MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot};
 use serde::Deserialize;
+use text::BufferId;
 use workspace::searchable::Direction;
 
 use std::{borrow::Cow, cell::OnceCell, ops::Range, sync::Arc};
@@ -35,6 +37,7 @@ pub struct TextLayoutDetails {
     pub visible_columns: Option<f64>,
     pub vertical_scroll_margin: ScrollOffset,
     pub(crate) grid_cell: OnceCell<GridCell>,
+    pub(crate) tree_sitter_by_buffer: Option<Arc<HashMap<BufferId, bool>>>,
 }
 
 impl TextLayoutDetails {
@@ -52,11 +55,22 @@ impl TextLayoutDetails {
         })
     }
 
-    pub(crate) fn ruler_shaper(&self) -> RulerShaper {
+    pub(crate) fn ruler_shaper(&self, snapshot: &DisplaySnapshot, row: DisplayRow) -> RulerShaper {
+        let tree_sitter = match &self.tree_sitter_by_buffer {
+            None => true,
+            Some(tree_sitter_by_buffer) => snapshot
+                .point_to_buffer_point(DisplayPoint::new(row, 0).to_point(snapshot))
+                .and_then(|(buffer, ..)| tree_sitter_by_buffer.get(&buffer.remote_id()).copied())
+                .unwrap_or(false),
+        };
         RulerShaper {
             text_system: self.text_system.clone(),
             style: self.editor_style.clone(),
             font_size: self.font_size(),
+            language_aware: LanguageAwareStyling {
+                tree_sitter,
+                diagnostics: true,
+            },
         }
     }
 
